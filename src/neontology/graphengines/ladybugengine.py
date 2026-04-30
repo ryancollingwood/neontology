@@ -249,27 +249,233 @@ class LadybugEngine(GraphEngineBase):
     # Abstract methods — must be implemented (see 03-abstract-methods.md)
     # ------------------------------------------------------------------
 
+    def _ladybug_node_to_neontology_node(
+        self,
+        node_dict: dict,
+        node_classes: dict,
+    ) -> Optional["BaseNode"]:
+        """Convert a Ladybug node dict to a neontology BaseNode instance.
+
+        Args:
+            node_dict: Dict returned by ladybug for a node value. Must contain
+                       '_label' and all property keys.
+            node_classes: Mapping of label strings to BaseNode subclasses.
+                          Passed in from evaluate_query.
+
+        Returns:
+            A BaseNode instance, or None if the label is not in node_classes
+            (with a warning emitted).
+        """
+        import warnings
+
+        label = node_dict.get("_label")
+        if label not in node_classes:
+            warnings.warn(f"Received node with label '{label}' but no matching class found in node_classes.")
+            return None
+
+        node_class = node_classes[label]
+
+        # Build the properties dict by filtering out Ladybug internal keys
+        # that start with '_' — these are not model fields.
+        props = {k: v for k, v in node_dict.items() if not k.startswith("_")}
+
+        return node_class(**props)
+
+    def _ladybug_rel_to_neontology_rel(
+        self,
+        rel_dict: dict,
+        rel_classes: dict,
+        node_classes: dict,
+        hydrated_nodes_by_label_pp: dict,
+    ) -> Optional["BaseRelationship"]:
+        """Convert a Ladybug relationship dict to a neontology BaseRelationship instance.
+
+        Args:
+            rel_dict: Dict returned by ladybug for a relationship value. Must contain
+                      '_label', '_src', '_dst', and property keys.
+            rel_classes: Mapping of relationship type strings to RelationshipTypeData.
+            node_classes: Mapping of label strings to BaseNode subclasses.
+            hydrated_nodes_by_label_pp: Dict keyed by '{label}:{primary_property_value}'
+                                         to already-hydrated BaseNode instances. Used to
+                                         attach source and target nodes to the relationship.
+                                         This dict is built from all nodes returned in the
+                                         same query result.
+
+        Returns:
+            A BaseRelationship instance, or None on failure (with a warning).
+        """
+        import warnings
+
+        rel_type = rel_dict.get("_label")
+        rel_type_data = rel_classes.get(rel_type)
+
+        if rel_type_data is None:
+            warnings.warn(
+                f"Received relationship of type '{rel_type}' but no matching class found in relationship_classes. "
+                "Did you define the class before initializing Neontology?"
+            )
+            return None
+
+        # Filter out internal Ladybug keys (_id, _src, _dst, _label)
+        props = {k: v for k, v in rel_dict.items() if not k.startswith("_")}
+
+        rel_class = rel_type_data.relationship_class
+        src_class = rel_type_data.source_class if hasattr(rel_type_data, "source_class") else None
+        tgt_class = rel_type_data.target_class if hasattr(rel_type_data, "target_class") else None
+
+        source_node = None
+        target_node = None
+
+        if src_class:
+            src_label = src_class.__primarylabel__
+            for key, node in hydrated_nodes_by_label_pp.items():
+                if key.startswith(f"{src_label}:"):
+                    source_node = node
+                    break
+
+        if tgt_class:
+            tgt_label = tgt_class.__primarylabel__
+            for key, node in hydrated_nodes_by_label_pp.items():
+                if key.startswith(f"{tgt_label}:"):
+                    target_node = node
+                    break
+
+        props["source"] = source_node
+        props["target"] = target_node
+
+        try:
+            return rel_class(**props)
+        except Exception as exc:
+            warnings.warn(f"Failed to hydrate relationship '{rel_type}': {exc}")
+            return None
+
     def verify_connection(self) -> bool:
-        """Verify the connection to the database."""
-        raise NotImplementedError
+        """Verify that the Ladybug connection is working.
+
+        Executes a trivial query. Returns True if it succeeds, False on any error.
+
+        Returns:
+            bool: True if the connection is usable, False otherwise.
+        """
+        try:
+            self.conn.execute("RETURN 1")
+            return True
+        except Exception:
+            return False
 
     def close_connection(self) -> None:
-        """Close the database connection."""
-        raise NotImplementedError
+        """Close the Ladybug connection and database handle.
+
+        Safe to call even if the connection or database is already closed.
+        """
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        try:
+            self.db.close()
+        except Exception:
+            pass
 
     def evaluate_query(
         self,
         cypher: str,
-        params: dict[str, Any] = {},
-        node_classes: dict = {},
-        relationship_classes: dict = {},
+        params: dict[str, Any] = None,
+        node_classes: dict = None,
+        relationship_classes: dict = None,
     ) -> NeontologyResult:
-        """Evaluate a cypher query."""
-        raise NotImplementedError
+        """Execute a Cypher query and return hydrated neontology records.
 
-    def evaluate_query_single(self, cypher: str, params: dict[str, Any] = {}) -> Any:
-        """Evaluate a cypher query that returns a single result."""
-        raise NotImplementedError
+        Args:
+            cypher: The Cypher query string. Use $param_name placeholders for
+                    parameters — ladybug uses the same $param syntax as Neo4j.
+            params: Dict of parameter name → value. Passed directly to
+                    conn.execute(parameters=...). Do not include the $ prefix in dict keys.
+            node_classes: Dict mapping label strings to BaseNode subclasses.
+                          Used to hydrate returned node values.
+            relationship_classes: Dict mapping relationship type strings to
+                                  RelationshipTypeData. Used to hydrate returned
+                                  relationship values.
+
+        Returns:
+            NeontologyResult with records, nodes, relationships, and paths populated.
+        """
+        if params is None:
+            params = {}
+        if node_classes is None:
+            node_classes = {}
+        if relationship_classes is None:
+            relationship_classes = {}
+
+        query_result = self.conn.execute(cypher, parameters=params if params else None)
+
+        raw_records = []
+        hydrated_nodes_by_label_pp: dict[str, "BaseNode"] = {}
+        all_rels: list["BaseRelationship"] = []
+
+        column_names = query_result.get_column_names()
+
+        while query_result.has_next():
+            row = query_result.get_next()
+            record: dict[str, dict] = {"nodes": {}, "relationships": {}, "paths": {}}
+
+            for col_name, value in zip(column_names, row):
+                if value is None:
+                    continue
+
+                if isinstance(value, dict) and "_label" in value:
+                    if "_src" in value:
+                        # This is a relationship dict
+                        neontology_rel = self._ladybug_rel_to_neontology_rel(
+                            value, relationship_classes, node_classes, hydrated_nodes_by_label_pp
+                        )
+                        if neontology_rel:
+                            record["relationships"][col_name] = neontology_rel
+                            all_rels.append(neontology_rel)
+                    else:
+                        # This is a node dict
+                        neontology_node = self._ladybug_node_to_neontology_node(value, node_classes)
+                        if neontology_node:
+                            record["nodes"][col_name] = neontology_node
+                            key = f"{neontology_node.__primarylabel__}:{neontology_node.get_pp()}"
+                            hydrated_nodes_by_label_pp[key] = neontology_node
+
+            raw_records.append(record)
+
+        unique_nodes = list(hydrated_nodes_by_label_pp.values())
+
+        return NeontologyResult(
+            records_raw=raw_records,
+            records=raw_records,
+            nodes=unique_nodes,
+            relationships=all_rels,
+            paths=[],  # TODO: implement path hydration
+        )
+
+    def evaluate_query_single(self, cypher: str, params: dict[str, Any] = None) -> Any:
+        """Execute a query and return the first value of the first row.
+
+        Used for queries that return a single scalar value, such as COUNT queries
+        or DML statements that return nothing meaningful.
+
+        Args:
+            cypher: The Cypher query string.
+            params: Parameter dict. Keys are plain strings (no '$' prefix).
+
+        Returns:
+            The first column value of the first row, or None if no rows returned.
+        """
+        if params is None:
+            params = {}
+
+        query_result = self.conn.execute(cypher, parameters=params if params else None)
+
+        if query_result.has_next():
+            row = query_result.get_next()
+            if row:
+                return row[0]
+
+        return None
 
     def apply_constraint(self, label: str, property: str) -> None:
         """Create the NODE TABLE for the given label if it does not exist.

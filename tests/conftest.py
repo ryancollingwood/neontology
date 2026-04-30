@@ -7,7 +7,7 @@ import pytest
 from dotenv import load_dotenv
 
 from neontology import GraphConnection, init_neontology
-from neontology.graphengines import MemgraphConfig, Neo4jConfig, NetworkxConfig
+from neontology.graphengines import MemgraphConfig, Neo4jConfig, NetworkxConfig, LadybugConfig
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,13 @@ def reset_constraints():
             },
             id="networkx-engine",
         ),
+        pytest.param(
+            {
+                "graph_engine": "LADYBUG",
+                "graph_config_vars": {},
+            },
+            id="ladybug-engine",
+        ),
     ],
 )
 def get_graph_config(request, tmp_path_factory) -> tuple:
@@ -66,6 +73,7 @@ def get_graph_config(request, tmp_path_factory) -> tuple:
         "NEO4J": Neo4jConfig,
         "MEMGRAPH": MemgraphConfig,
         "NETWORKX": NetworkxConfig,
+        "LADYBUG": LadybugConfig,
     }
 
     graph_config_vars = request.param["graph_config_vars"]
@@ -74,11 +82,8 @@ def get_graph_config(request, tmp_path_factory) -> tuple:
 
     # build config using environment variables
     for key, value in graph_config_vars.items():
-
         graph_config[key] = os.getenv(value)
-        assert (
-            graph_config[key] is not None
-        ), f"Environment variable {value} is not set."
+        assert graph_config[key] is not None, f"Environment variable {value} is not set."
 
     graph_engine = request.param["graph_engine"]
 
@@ -109,9 +114,7 @@ def graph_db(request, tmp_path_factory, get_graph_config):
 
     # most backends will return 0
     # Grand will return an empty list
-    assert (
-        not node_count
-    ), f"Looks like there are {node_count} nodes in the database, it should be empty."
+    assert not node_count, f"Looks like there are {node_count} nodes in the database, it should be empty."
 
     yield gc
 
