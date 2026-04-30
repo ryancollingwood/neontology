@@ -33,6 +33,8 @@ dependencies = [
     "Jinja2>=3.0,<4",
     "typing-extensions>=4.0,<5",
     "PyYAML>=6.0,<7",
+    "ladybug>=0.15.3",
+    "networkx>=3.2.1",
 ]
 
 [dependency-groups]
