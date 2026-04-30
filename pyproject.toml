@@ -11,7 +11,7 @@ authors = [
 description = "A Python package for modelling data in a Neo4j graph database with Pydantic and Pandas."
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
@@ -33,6 +33,7 @@ dependencies = [
     "Jinja2>=3.0,<4",
     "typing-extensions>=4.0,<5",
     "PyYAML>=6.0,<7",
+    "ladybug==0.16.0",
 ]
 
 [dependency-groups]
