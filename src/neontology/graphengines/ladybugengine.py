@@ -139,6 +139,21 @@ def _python_type_to_ladybug(annotation: Any) -> str:
     return type_map.get(annotation, "STRING")
 
 
+def _expand_set_clause(alias: str, props_dict: dict, prefix: str) -> tuple[str, dict]:
+    """Convert a dict of properties into an explicit SET clause and flat params dict."""
+    if not props_dict:
+        return "", {}
+
+    assignments = []
+    flat_params = {}
+    for prop_name, value in props_dict.items():
+        param_key = f"{prefix}_{prop_name}"
+        assignments.append(f"{alias}.{prop_name} = ${param_key}")
+        flat_params[param_key] = value
+
+    return ", ".join(assignments), flat_params
+
+
 class LadybugEngine(GraphEngineBase):
     """Graph engine for Ladybug embedded graph databases."""
 
@@ -533,12 +548,116 @@ class LadybugEngine(GraphEngineBase):
     # ------------------------------------------------------------------
 
     def create_nodes(self, labels: list, pp_key: str, properties: list, node_class: type[BaseNodeT]) -> list[BaseNodeT]:
-        """Create nodes."""
-        raise NotImplementedError
+        """Create nodes in Ladybug for the given node class.
+
+        Overrides the base class implementation because:
+        1. The base class uses multi-label syntax (n:Label1:Label2) which Ladybug rejects.
+        2. The base class uses SET n += dict which Ladybug does not support.
+
+        Args:
+            labels: List of labels. Only labels[0] (the primary label) is used.
+                    Ladybug does not support multi-label nodes.
+            pp_key: The primary property key name.
+            properties: List of dicts, each with keys:
+                        - 'pp': the primary property value
+                        - 'props': dict of all other property name → value pairs
+            node_class: The BaseNode subclass to create instances of.
+
+        Returns:
+            List of created BaseNode instances.
+        """
+        # Ensure the NODE TABLE exists before writing
+        self._ensure_node_table(node_class)
+
+        label = labels[0]  # Ladybug: one label per node
+        node_classes = {node_class.__primarylabel__: node_class}
+        created_nodes = []
+
+        for i, node_props in enumerate(properties):
+            # Build flat params for this individual node.
+            # Prefix with index 'i' to avoid param name collisions if this loop
+            # is ever batched differently in the future.
+            params: dict[str, Any] = {f"pp_{i}": node_props["pp"]}
+            prop_assignments = [f"{pp_key} = $pp_{i}"]
+
+            for prop_name, prop_value in node_props.get("props", {}).items():
+                param_key = f"p_{i}_{prop_name}"
+                params[param_key] = prop_value
+                prop_assignments.append(f"{prop_name} = ${param_key}")
+
+            set_clause = ", ".join(f"{prop_name} = ${f'p_{i}_{prop_name}'}" for prop_name in node_props.get("props", {}).keys())
+
+            if set_clause:
+                cypher = f"CREATE (n:{label} {{{pp_key}: $pp_{i}}})\nSET {set_clause}\nRETURN n"
+            else:
+                cypher = f"CREATE (n:{label} {{{pp_key}: $pp_{i}}}) RETURN n"
+
+            result = self.evaluate_query(cypher, params, node_classes)
+            created_nodes.extend(result.nodes)
+
+        return created_nodes
 
     def merge_nodes(self, labels: list, pp_key: str, properties: list, node_class: type[BaseNodeT]) -> list[BaseNodeT]:
-        """Merge nodes."""
-        raise NotImplementedError
+        """Merge (create or update) nodes in Ladybug for the given node class.
+
+        Overrides the base class implementation because:
+        1. The base class uses multi-label syntax which Ladybug rejects.
+        2. The base class uses SET n += dict which Ladybug does not support.
+
+        Args:
+            labels: List of labels. Only labels[0] is used.
+            pp_key: The primary property key name.
+            properties: List of dicts, each with keys:
+                        - 'pp': the primary property value
+                        - 'set_on_match': dict of properties to set on existing nodes
+                        - 'set_on_create': dict of properties to set on new nodes
+                        - 'always_set': dict of properties to set regardless
+            node_class: The BaseNode subclass to merge.
+
+        Returns:
+            List of merged BaseNode instances.
+        """
+        self._ensure_node_table(node_class)
+
+        label = labels[0]
+        node_classes = {node_class.__primarylabel__: node_class}
+        merged_nodes = []
+
+        for i, node_props in enumerate(properties):
+            pp_value = node_props["pp"]
+            set_on_match: dict = node_props.get("set_on_match", {}) or {}
+            set_on_create: dict = node_props.get("set_on_create", {}) or {}
+            always_set: dict = node_props.get("always_set", {}) or {}
+
+            params: dict[str, Any] = {f"pp_{i}": pp_value}
+
+            # Build ON MATCH SET clause
+            match_clause, match_params = _expand_set_clause("n", set_on_match, f"m{i}")
+            params.update(match_params)
+
+            # Build ON CREATE SET clause
+            create_clause, create_params = _expand_set_clause("n", set_on_create, f"c{i}")
+            params.update(create_params)
+
+            # Build always SET clause
+            always_clause, always_params = _expand_set_clause("n", always_set, f"a{i}")
+            params.update(always_params)
+
+            cypher = f"MERGE (n:{label} {{{pp_key}: $pp_{i}}})\n"
+
+            if match_clause:
+                cypher += f"ON MATCH SET {match_clause}\n"
+            if create_clause:
+                cypher += f"ON CREATE SET {create_clause}\n"
+            if always_clause:
+                cypher += f"SET {always_clause}\n"
+
+            cypher += "RETURN n"
+
+            result = self.evaluate_query(cypher, params, node_classes)
+            merged_nodes.extend(result.nodes)
+
+        return merged_nodes
 
     def merge_relationships(
         self,
@@ -550,8 +669,115 @@ class LadybugEngine(GraphEngineBase):
         merge_on_props: list[str],
         rel_props: list[dict],
     ) -> None:
-        """Merge relationships."""
-        raise NotImplementedError
+        """Merge relationships in Ladybug between existing nodes.
+
+        Overrides the base class implementation because:
+        1. The base class uses SET r += dict which Ladybug does not support.
+
+        The REL TABLE is created lazily if it does not exist.
+
+        Args:
+            source_label: Primary label of the source node.
+            target_label: Primary label of the target node.
+            source_prop: Property name on the source node to match on.
+            target_prop: Property name on the target node to match on.
+            rel_type: The relationship type string (e.g. "KNOWS").
+            merge_on_props: List of relationship property names to include in
+                            the MERGE pattern (uniqueness identity for the edge).
+            rel_props: List of dicts, one per relationship to merge.
+        """
+        if not rel_props:
+            return
+
+        # We need the relationship class to build the REL TABLE DDL.
+        # Resolve it from GraphConnection.global_rels.
+        from ..graphconnection import GraphConnection
+
+        rel_type_data = GraphConnection.global_rels.get(rel_type)
+        rel_class = rel_type_data.relationship_class if rel_type_data else None
+
+        if rel_class is None:
+            raise RuntimeError(
+                f"Cannot merge relationships of type '{rel_type}': "
+                "no matching BaseRelationship class found in GraphConnection.global_rels. "
+                "Ensure the class is defined before calling init_neontology()."
+            )
+
+        self._ensure_rel_table(rel_type, source_label, target_label, rel_class)
+
+        for i, rp in enumerate(rel_props):
+            params: dict[str, Any] = {
+                f"src_{i}": rp["source_prop"],
+                f"tgt_{i}": rp["target_prop"],
+            }
+
+            # Build the MERGE pattern identity props (merge_on_props)
+            merge_pattern_parts = []
+            for prop_name in merge_on_props:
+                param_key = f"merge_{i}_{prop_name}"
+                params[param_key] = rp.get(prop_name)
+                merge_pattern_parts.append(f"{prop_name}: ${param_key}")
+
+            merge_props_str = "{" + ", ".join(merge_pattern_parts) + "}" if merge_pattern_parts else ""
+
+            # Build SET clauses
+            match_clause, match_params = _expand_set_clause("r", rp.get("set_on_match", {}) or {}, f"rm{i}")
+            params.update(match_params)
+
+            create_clause, create_params = _expand_set_clause("r", rp.get("set_on_create", {}) or {}, f"rc{i}")
+            params.update(create_params)
+
+            always_clause, always_params = _expand_set_clause("r", rp.get("always_set", {}) or {}, f"ra{i}")
+            params.update(always_params)
+
+            cypher = (
+                f"MATCH (source:{source_label}) WHERE source.{source_prop} = $src_{i}\n"
+                f"MATCH (target:{target_label}) WHERE target.{target_prop} = $tgt_{i}\n"
+                f"MERGE (source)-[r:{rel_type} {merge_props_str}]->(target)\n"
+            )
+
+            if match_clause:
+                cypher += f"ON MATCH SET {match_clause}\n"
+            if create_clause:
+                cypher += f"ON CREATE SET {create_clause}\n"
+            if always_clause:
+                cypher += f"SET {always_clause}\n"
+
+            self.evaluate_query(cypher, params)
+
+    def _filters_to_where_clause(self, filters: Optional[dict] = None) -> tuple[Optional[str], dict]:
+        """Generate a WHERE clause from a filter dict for Ladybug queries.
+
+        Overrides the base class to reject case-insensitive filter types that
+        rely on toLower(), which Ladybug does not support.
+
+        Supported filter types: exact, contains, startswith, gt, lt, gte, lte, in, isnull
+        Unsupported filter types: iexact, icontains, istartswith
+
+        Args:
+            filters: Dict of field__lookuptype -> value entries.
+
+        Returns:
+            Tuple of (where_clause_string_or_None, params_dict).
+
+        Raises:
+            ValueError: If an unsupported case-insensitive filter type is used.
+        """
+        _unsupported = {"iexact", "icontains", "istartswith"}
+
+        if filters:
+            for key in filters:
+                if "__" in key:
+                    _, lookup_type = key.split("__", 1)
+                    if lookup_type in _unsupported:
+                        raise ValueError(
+                            f"Filter type '{lookup_type}' is not supported by the Ladybug engine. "
+                            f"Ladybug does not support the toLower() function. "
+                            f"Use case-sensitive alternatives: 'exact', 'contains', 'startswith'."
+                        )
+
+        # Delegate to the base class for all supported filter types
+        return super()._filters_to_where_clause(filters)
 
 
 class LadybugConfig(GraphEngineConfig):
