@@ -283,7 +283,7 @@ class LadybugEngine(GraphEngineBase):
         """
         import warnings
 
-        label = node_dict.get("_label")
+        label = node_dict.get("_label") or node_dict.get("_LABEL")
         if label not in node_classes:
             warnings.warn(f"Received node with label '{label}' but no matching class found in node_classes.")
             return None
@@ -301,7 +301,7 @@ class LadybugEngine(GraphEngineBase):
         rel_dict: dict,
         rel_classes: dict,
         node_classes: dict,
-        hydrated_nodes_by_label_pp: dict,
+        hydrated_nodes_by_id: dict,
     ) -> Optional["BaseRelationship"]:
         """Convert a Ladybug relationship dict to a neontology BaseRelationship instance.
 
@@ -310,18 +310,16 @@ class LadybugEngine(GraphEngineBase):
                       '_label', '_src', '_dst', and property keys.
             rel_classes: Mapping of relationship type strings to RelationshipTypeData.
             node_classes: Mapping of label strings to BaseNode subclasses.
-            hydrated_nodes_by_label_pp: Dict keyed by '{label}:{primary_property_value}'
-                                         to already-hydrated BaseNode instances. Used to
-                                         attach source and target nodes to the relationship.
-                                         This dict is built from all nodes returned in the
-                                         same query result.
+            hydrated_nodes_by_id: Dict keyed by Ladybug node IDs (as strings) to already-hydrated
+                                  BaseNode instances. Used to attach source and target nodes to the
+                                  relationship.
 
         Returns:
             A BaseRelationship instance, or None on failure (with a warning).
         """
         import warnings
 
-        rel_type = rel_dict.get("_label")
+        rel_type = rel_dict.get("_label") or rel_dict.get("_LABEL")
         rel_type_data = rel_classes.get(rel_type)
 
         if rel_type_data is None:
@@ -335,25 +333,17 @@ class LadybugEngine(GraphEngineBase):
         props = {k: v for k, v in rel_dict.items() if not k.startswith("_")}
 
         rel_class = rel_type_data.relationship_class
-        src_class = rel_type_data.source_class if hasattr(rel_type_data, "source_class") else None
-        tgt_class = rel_type_data.target_class if hasattr(rel_type_data, "target_class") else None
 
         source_node = None
         target_node = None
 
-        if src_class:
-            src_label = src_class.__primarylabel__
-            for key, node in hydrated_nodes_by_label_pp.items():
-                if key.startswith(f"{src_label}:"):
-                    source_node = node
-                    break
+        src_id = rel_dict.get("_src") or rel_dict.get("_SRC")
+        if src_id is not None:
+            source_node = hydrated_nodes_by_id.get(str(src_id))
 
-        if tgt_class:
-            tgt_label = tgt_class.__primarylabel__
-            for key, node in hydrated_nodes_by_label_pp.items():
-                if key.startswith(f"{tgt_label}:"):
-                    target_node = node
-                    break
+        dst_id = rel_dict.get("_dst") or rel_dict.get("_DST")
+        if dst_id is not None:
+            target_node = hydrated_nodes_by_id.get(str(dst_id))
 
         props["source"] = source_node
         props["target"] = target_node
@@ -426,6 +416,7 @@ class LadybugEngine(GraphEngineBase):
 
         raw_records = []
         hydrated_nodes_by_label_pp: dict[str, "BaseNode"] = {}
+        hydrated_nodes_by_id: dict[str, "BaseNode"] = {}
         all_rels: list["BaseRelationship"] = []
 
         column_names = query_result.get_column_names()
@@ -434,19 +425,30 @@ class LadybugEngine(GraphEngineBase):
             row = query_result.get_next()
             record: dict[str, dict] = {"nodes": {}, "relationships": {}, "paths": {}}
 
+            # Process nodes first so they are available in hydrated_nodes_by_label_pp for relationships
+            delayed_rels = []
+
             for col_name, value in zip(column_names, row):
                 if value is None:
                     continue
 
-                if isinstance(value, dict) and "_label" in value:
-                    if "_src" in value:
-                        # This is a relationship dict
-                        neontology_rel = self._ladybug_rel_to_neontology_rel(
-                            value, relationship_classes, node_classes, hydrated_nodes_by_label_pp
-                        )
-                        if neontology_rel:
-                            record["relationships"][col_name] = neontology_rel
-                            all_rels.append(neontology_rel)
+                if (
+                    isinstance(value, list)
+                    and len(value) == 1
+                    and isinstance(value[0], dict)
+                    and ("_label" in value[0] or "_LABEL" in value[0])
+                ):
+                    value = value[0]
+
+                is_node_or_rel = False
+                if isinstance(value, dict):
+                    if "_label" in value or "_LABEL" in value:
+                        is_node_or_rel = True
+
+                if is_node_or_rel:
+                    if "_src" in value or "_SRC" in value:
+                        # Delay relationship processing until nodes are hydrated
+                        delayed_rels.append((col_name, value))
                     else:
                         # This is a node dict
                         neontology_node = self._ladybug_node_to_neontology_node(value, node_classes)
@@ -454,6 +456,19 @@ class LadybugEngine(GraphEngineBase):
                             record["nodes"][col_name] = neontology_node
                             key = f"{neontology_node.__primarylabel__}:{neontology_node.get_pp()}"
                             hydrated_nodes_by_label_pp[key] = neontology_node
+                            if "_id" in value:
+                                hydrated_nodes_by_id[str(value["_id"])] = neontology_node
+                            elif "_ID" in value:
+                                hydrated_nodes_by_id[str(value["_ID"])] = neontology_node
+
+            for col_name, value in delayed_rels:
+                # This is a relationship dict
+                neontology_rel = self._ladybug_rel_to_neontology_rel(
+                    value, relationship_classes, node_classes, hydrated_nodes_by_id
+                )
+                if neontology_rel:
+                    record["relationships"][col_name] = neontology_rel
+                    all_rels.append(neontology_rel)
 
             raw_records.append(record)
 
@@ -483,14 +498,25 @@ class LadybugEngine(GraphEngineBase):
         if params is None:
             params = {}
 
-        query_result = self.conn.execute(cypher, parameters=params if params else None)
+        try:
+            query_result = self.conn.execute(cypher, parameters=params if params else None)
 
-        if query_result.has_next():
-            row = query_result.get_next()
-            if row:
-                return row[0]
+            if query_result.has_next():
+                row = query_result.get_next()
+                if row:
+                    return row[0]
 
-        return None
+            return None
+        except RuntimeError as e:
+            # Handle the case where the table doesn't exist yet, which Ladybug raises as a RuntimeError
+            if "does not exist" in str(e):
+                if cypher.strip().upper().startswith("MATCH"):
+                    # Return 0 for count queries, or None for normal match queries on non-existent tables
+                    if "COUNT(" in cypher.upper():
+                        return 0
+                    return None
+
+            raise
 
     def apply_constraint(self, label: str, property: str) -> None:
         """Create the NODE TABLE for the given label if it does not exist.
@@ -630,6 +656,13 @@ class LadybugEngine(GraphEngineBase):
             always_set: dict = node_props.get("always_set", {}) or {}
 
             params: dict[str, Any] = {f"pp_{i}": pp_value}
+
+            if pp_key in set_on_match:
+                del set_on_match[pp_key]
+            if pp_key in set_on_create:
+                del set_on_create[pp_key]
+            if pp_key in always_set:
+                del always_set[pp_key]
 
             # Build ON MATCH SET clause
             match_clause, match_params = _expand_set_clause("n", set_on_match, f"m{i}")
