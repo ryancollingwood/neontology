@@ -4,5 +4,5 @@
 [x] [Schema and Management](02-schema-management.md)
 [x] [Abstract Methods](03-abstract-methods.md)
 [x] [Concrete Methods](04-concrete-overrides.md)
-[ ] [Registration and Testing](05-registration-and-testing.md)
+[x] [Registration and Testing](05-registration-and-testing.md)
 
