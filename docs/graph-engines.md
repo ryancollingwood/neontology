@@ -18,6 +18,7 @@ You can also use the NEONTOLOGY_ENGINE environment variable to set the graph eng
 * `NEO4J`
 * `MEMGRAPH`
 * `NETWORKX`
+* `LADYBUG`
 
 ### Neo4j
 
@@ -80,6 +81,42 @@ init_neontology(config)
 gc = GraphConnection()
 gc.evaluate_query("MATCH (n) RETURN n")
 ```
+
+### Ladybug
+
+Neontology supports Ladybug (formerly Kuzu) as an embedded, in-process structured property graph database backend.
+
+Unlike Neo4j or Memgraph, Ladybug does not run as a separate server so no network connection is required. Instead, it reads and writes to a local database file (or runs entirely in memory).
+
+Working with the `LadybugEngine` requires additional dependencies:
+
+```bash
+pip install neontology[ladybug]
+```
+
+To configure Neontology to use Ladybug, initialize it with a `LadybugConfig`:
+
+```python
+from neontology import GraphConnection, init_neontology
+from neontology.graphengines import LadybugConfig
+
+config = LadybugConfig(
+    database_path="my_graph.db" # Optional: If omitted, an in-memory database is used. OR use LADYBUG_DATABASE_PATH environment variable.
+)
+
+init_neontology(config)
+
+gc = GraphConnection()
+gc.evaluate_query_single("MATCH (n) RETURN COUNT(n)")
+```
+
+#### Schema Management
+
+Ladybug requires strict schema definitions (`NODE TABLE` and `REL TABLE`) before any data can be inserted. Neontology's `LadybugEngine` handles this automatically behind the scenes. When you merge or create a node or relationship, Neontology dynamically checks your Pydantic models and generates the necessary table structures (including primary key constraints) before inserting the data.
+
+#### Limitations
+
+Because Ladybug does not include a `toLower()` string function, case-insensitive node filters (such as `iexact`, `icontains`, and `istartswith`) are not supported by the `LadybugEngine`. Case-sensitive filters like `exact`, `contains`, and `startswith` work as expected.
 
 ## Graph Engines and Graph Connections
 
